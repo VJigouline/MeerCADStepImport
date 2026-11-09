@@ -11,6 +11,13 @@ export interface StepThreeOptions {
   yUp?: boolean;
   /** Render both sides of faces, for open shells and surface models. Default true. */
   doubleSided?: boolean;
+  /**
+   * Add the faces' boundary loops (their edges) as a THREE.LineSegments child of each mesh that
+   * has them, marked with userData.stepEdges. Default true.
+   */
+  edges?: boolean;
+  /** Colour of those lines. Default 0x202020. */
+  edgeColor?: THREE.ColorRepresentation;
 }
 
 /** What each three.js object made from a STEP node carries in userData.step. */
@@ -41,6 +48,7 @@ export function toThree(result: StepImportResult, options: StepThreeOptions = {}
   const metres = options.metres ?? true;
   const yUp = options.yUp ?? true;
   const side = options.doubleSided ?? true ? THREE.DoubleSide : THREE.FrontSide;
+  const withEdges = options.edges ?? true;
   const root = new THREE.Group();
   root.name = result.header.fileName || 'STEP model';
   root.userData.stepSchema = result.schema;
@@ -49,6 +57,22 @@ export function toThree(result: StepImportResult, options: StepThreeOptions = {}
 
   const geometries = new Map<object, THREE.BufferGeometry>();
   const materials = new Map<string, THREE.Material>();
+  const edgeGeometries = new Map<Float32Array, THREE.BufferGeometry>();
+  let edgeMaterial: THREE.LineBasicMaterial | null = null;
+  const edgesOf = (edges: Float32Array): THREE.LineSegments => {
+    let geometry = edgeGeometries.get(edges);
+    if (!geometry) {
+      geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(edges, 3));
+      geometry.computeBoundingSphere();
+      edgeGeometries.set(edges, geometry);
+    }
+    edgeMaterial ??= new THREE.LineBasicMaterial({ name: 'STEP edges', color: new THREE.Color(options.edgeColor ?? 0x202020) });
+    const lines = new THREE.LineSegments(geometry, edgeMaterial);
+    lines.name = 'Edges';
+    lines.userData.stepEdges = true;
+    return lines;
+  };
   const geometryOf = (mesh: StepMesh): THREE.BufferGeometry => {
     let geometry = geometries.get(mesh.data);
     if (!geometry) {
@@ -75,6 +99,10 @@ export function toThree(result: StepImportResult, options: StepThreeOptions = {}
         transparent: style.opacity < 1,
         opacity: style.opacity,
         depthWrite: style.opacity >= 1,
+        // Pushed back a little so that edges drawn on the faces aren't hidden by them.
+        polygonOffset: withEdges,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
       });
       materials.set(key, material);
     }
@@ -114,6 +142,7 @@ export function toThree(result: StepImportResult, options: StepThreeOptions = {}
       three.castShadow = true;
       three.receiveShadow = true;
       place(three, mesh.matrix);
+      if (withEdges && mesh.edges) three.add(edgesOf(mesh.edges));
       group.add(three);
     }
     for (const child of node.children) group.add(build(child));

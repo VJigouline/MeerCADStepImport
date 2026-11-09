@@ -31,6 +31,12 @@ export interface StyledMesh {
   itemType: string;
   style: StepStyle;
   data: MeshData;
+  /**
+   * The faces' boundary loops (their edges) as line segments: pairs of points in the same
+   * coordinates as `data`. An edge two faces share is in once. Null where there are no loops,
+   * as for AP242 tessellated shapes.
+   */
+  edges: Float32Array | null;
 }
 
 export interface TessellationStats {
@@ -89,28 +95,32 @@ export class ShapeTessellator {
     const faces: FaceRef[] = [];
     const tessellated: FaceRef[] = [];
     this.collect(itemId, false, this.styles.byItem.get(itemId) ?? inherited, faces, tessellated, 0);
-    const groups = new Map<string, { style: StepStyle; builder: MeshBuilder }>();
+    const groups = new Map<string, { style: StepStyle; builder: MeshBuilder; edges: EdgeCollector }>();
+    const drawn = new Set<number>();
     const groupOf = (style: StepStyle | null) => {
       const s = style ?? DEFAULT_STYLE;
       const key = styleKey(s);
       let g = groups.get(key);
       if (!g) {
-        g = { style: s, builder: new MeshBuilder() };
+        g = { style: s, builder: new MeshBuilder(), edges: new EdgeCollector(drawn) };
         groups.set(key, g);
       }
-      return g.builder;
+      return g;
     };
     if (faces.length) {
       const options = this.faceOptions(faces);
-      for (const face of faces) this.face(face, options, groupOf(face.style));
+      for (const face of faces) {
+        const g = groupOf(face.style);
+        this.face(face, options, g.builder, g.edges);
+      }
     }
-    for (const face of tessellated) this.tessellatedFace(face, groupOf(face.style));
+    for (const face of tessellated) this.tessellatedFace(face, groupOf(face.style).builder);
     const name = str(e.args[0]);
     const out: StyledMesh[] = [];
-    for (const { style, builder } of groups.values()) {
+    for (const { style, builder, edges } of groups.values()) {
       if (builder.triangleCount === 0) continue;
       this.stats.triangles += builder.triangleCount;
-      out.push({ name, itemId, itemType: m.displayType(e), style, data: builder.build() });
+      out.push({ name, itemId, itemType: m.displayType(e), style, data: builder.build(), edges: edges.build() });
     }
     return out;
   }
@@ -169,10 +179,18 @@ export class ShapeTessellator {
         for (let depth = 0; curve && /^(SURFACE_CURVE|SEAM_CURVE|INTERSECTION_CURVE|TRIMMED_CURVE)$/.test(curve.type) && depth < 4; depth++) curve = this.model.deref(curve.args[1]);
         if (!curve) return;
         if (curve.type === 'CIRCLE' || curve.type === 'ELLIPSE') {
-          const centre = this.safePoint(refId(this.model.deref(curve.args[1])?.args[1]));
-          const r = Math.max(num(curve.args[2]), num(curve.args[3]));
-          add([centre[0] - r, centre[1] - r, centre[2] - r]);
-          add([centre[0] + r, centre[1] + r, centre[2] + r]);
+          // An arc's extent is that of the arc between its vertices, not of its whole circle: a
+          // short arc of a large circle, such as a meridian of a flat dome, would otherwise make
+          // the solid seem many times its size and its tolerance that much coarser.
+          const arc = refId(edge.args[1]) !== refId(edge.args[2]) ? this.arcPoints(edge) : null;
+          if (arc) {
+            for (const p of arc) add(p);
+          } else {
+            const centre = this.safePoint(refId(this.model.deref(curve.args[1])?.args[1]));
+            const r = Math.max(num(curve.args[2]), num(curve.args[3]));
+            add([centre[0] - r, centre[1] - r, centre[2] - r]);
+            add([centre[0] + r, centre[1] + r, centre[2] + r]);
+          }
         } else if (this.model.is(curve, 'B_SPLINE_CURVE', 'B_SPLINE_CURVE_WITH_KNOTS', 'BEZIER_CURVE', 'UNIFORM_CURVE', 'QUASI_UNIFORM_CURVE')) {
           const args = curve.parts ? this.model.partArgs(curve, 'B_SPLINE_CURVE') : curve.args.slice(1);
           for (const p of refIds(args?.[1])) add(this.safePoint(p));
@@ -208,6 +226,20 @@ export class ShapeTessellator {
     return { tolerance, angle: o.angularTolerance, maxTriangles: o.maxTrianglesPerFace };
   }
 
+  /** Points along an open circular or elliptical edge, a few degrees apart; null if it can't be read. */
+  private arcPoints(edge: StepEntity): Vec3[] | null {
+    try {
+      const g = this.geometry;
+      const curve = g.curve(refId(edge.args[3]));
+      const start = g.point(refId(edge.args[1])), end = g.point(refId(edge.args[2]));
+      // Finite, so that the ends count as apart, and loose: the turn angle sets the spacing.
+      const options: FaceOptions = { tolerance: length(sub(end, start)), angle: 0.2, maxTriangles: 0 };
+      return sampleEdge(curve, start, end, false, bool(edge.args[4], true), options);
+    } catch {
+      return null;
+    }
+  }
+
   private safePoint(id: number | null): Vec3 {
     try {
       return this.geometry.point(id);
@@ -216,7 +248,7 @@ export class ShapeTessellator {
     }
   }
 
-  private face(ref: FaceRef, options: FaceOptions, out: MeshBuilder): void {
+  private face(ref: FaceRef, options: FaceOptions, out: MeshBuilder, edges: EdgeCollector): void {
     const m = this.model;
     const e = m.get(ref.id);
     if (!e) return;
@@ -232,6 +264,10 @@ export class ShapeTessellator {
         if (!parts.length) continue;
         bounds.push(bool(bound.args[2], true) ? parts : parts.reverse().map(part => ({ edge: part.edge, points: part.points.slice().reverse() })));
       }
+      // An edge the face uses twice is a seam, with the face on both sides: not drawn as a loop.
+      const uses = new Map<number, number>();
+      for (const parts of bounds) for (const part of parts) if (part.edge !== null) uses.set(part.edge, (uses.get(part.edge) ?? 0) + 1);
+      for (const parts of bounds) for (const part of parts) if (part.edge === null || uses.get(part.edge) === 1) edges.add(part);
       if (e.type === 'FACE' || e.args[2] === undefined) {
         // A face without a surface: a planar polygon.
         this.planarFace(bounds.map(joinParts).filter(loop => loop.length >= 3), ref.flip, out);
@@ -241,10 +277,7 @@ export class ShapeTessellator {
       const sense = bool(e.args[3], true);
       let loops: Vec3[][];
       if (surface.uPeriod !== null || surface.vPeriod !== null) {
-        // On a closed surface, an edge the face uses twice is a seam with the face on both sides,
-        // not a boundary: leave it out, and the face is closed across the seam instead.
-        const uses = new Map<number, number>();
-        for (const parts of bounds) for (const part of parts) if (part.edge !== null) uses.set(part.edge, (uses.get(part.edge) ?? 0) + 1);
+        // On a closed surface, leave seams out, and the face is closed across the seam instead.
         loops = bounds.flatMap(parts => splitAtSeams(parts, edge => (uses.get(edge) ?? 0) > 1));
       } else {
         loops = bounds.map(joinParts);
@@ -373,6 +406,32 @@ export class ShapeTessellator {
     else if (normalsIn.length === 1) normals = Array.from({ length: vertexCount }, () => normalsIn[0]!.slice(0, 3)).flat();
     else normals = vertexNormals(positions, indices);
     out.append(positions, normals, indices, ref.flip);
+  }
+}
+
+/** Line segments along loops, each edge once across the faces of an item. */
+class EdgeCollector {
+  private readonly points: number[] = [];
+
+  constructor(private readonly drawn: Set<number>) {}
+
+  add(part: LoopPart): void {
+    if (part.edge !== null) {
+      if (this.drawn.has(part.edge)) return;
+      this.drawn.add(part.edge);
+    }
+    const p = part.points;
+    // A POLY_LOOP is closed back to its first point.
+    const count = part.edge === null && p.length > 2 ? p.length : p.length - 1;
+    for (let i = 0; i < count; i++) {
+      const a = p[i]!, b = p[(i + 1) % p.length]!;
+      if (a[0] === b[0] && a[1] === b[1] && a[2] === b[2]) continue;
+      this.points.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+    }
+  }
+
+  build(): Float32Array | null {
+    return this.points.length ? new Float32Array(this.points) : null;
   }
 }
 

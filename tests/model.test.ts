@@ -280,6 +280,22 @@ describe('three.js', () => {
     expect(bounds.max.y).toBeCloseTo(210, 6);
   });
 
+  it('adds face loops as line segments under each mesh, unless asked not to', () => {
+    const r = read(assembly());
+    const lines: THREE.LineSegments[] = [];
+    toThree(r).traverse(o => {
+      if ((o as THREE.LineSegments).isLineSegments) lines.push(o as THREE.LineSegments);
+    });
+    expect(lines).toHaveLength(2);
+    expect(lines[0]!.parent).toBeInstanceOf(THREE.Mesh);
+    expect(lines[0]!.userData.stepEdges).toBe(true);
+    expect(lines[0]!.geometry).toBe(lines[1]!.geometry);
+    expect(lines[0]!.geometry.getAttribute('position').count).toBe(24);
+    let any = false;
+    toThree(r, { edges: false }).traverse(o => (any ||= (o as THREE.LineSegments).isLineSegments === true));
+    expect(any).toBe(false);
+  });
+
   it('keeps world transforms usable straight away', () => {
     const { group } = loadStep(assembly());
     const p = new THREE.Vector3();

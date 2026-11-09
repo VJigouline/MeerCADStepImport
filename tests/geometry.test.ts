@@ -137,6 +137,48 @@ describe('faces', () => {
   });
 });
 
+describe('face loops', () => {
+  const segments = (edges: Float32Array | null) => {
+    const out: [number[], number[]][] = [];
+    for (let i = 0; edges && i < edges.length; i += 6) out.push([[...edges.slice(i, i + 3)], [...edges.slice(i + 3, i + 6)]]);
+    return out;
+  };
+
+  it('draws each edge of a box once', () => {
+    const [mesh] = allMeshes(solidOf(w => box(w, [0, 0, 0], [10, 20, 30])));
+    const s = segments(mesh!.edges);
+    expect(s).toHaveLength(12);
+    const total = s.reduce((sum, [a, b]) => sum + Math.hypot(b[0]! - a[0]!, b[1]! - a[1]!, b[2]! - a[2]!), 0);
+    expect(total).toBeCloseTo(4 * (10 + 20 + 30), 4);
+  });
+
+  it('measures a solid by the arcs it uses, not their whole circles', () => {
+    // A 10 mm segment of a 1 m circle, closed by its chord: sagging 0.0125 mm, so at 0.1% of the
+    // part's size it needs a point between its ends. Measured by the whole circle, it wouldn't.
+    const [mesh] = allMeshes(solidOf(w => {
+      const c = 999;
+      const a = w.vertex([0, 0, 0]), b = w.vertex([10, 0, 0]);
+      const chord = w.edge(a, b, w.line([0, 0, 0], [10, 0, 0]));
+      const arc = w.edge(b, a, w.circle([5, -c, 0], Math.hypot(5, c)));
+      const loop = w.loop([[chord, true], [arc, true]]);
+      return w.solid([w.face(w.add(`PLANE('',${w.axis([0, 0, 0])})`), [{ loop, outer: true }])], 'segment');
+    }));
+    expect(segments(mesh!.edges).length).toBeGreaterThan(2);
+  });
+
+  it('leaves out seams', () => {
+    const [mesh] = allMeshes(solidOf(w => cylinder(w, 5, 10)));
+    const s = segments(mesh!.edges);
+    expect(s.length).toBeGreaterThan(8);
+    // Only the two circles: every segment stays at z = 0 or z = 10, on the radius.
+    for (const [a, b] of s) {
+      expect(a[2]).toBeCloseTo(b[2]!, 9);
+      expect(Math.hypot(a[0]!, a[1]!)).toBeCloseTo(5, 4);
+    }
+    expect(allMeshes(solidOf(w => sphere(w, 5)))[0]!.edges).toBeNull();
+  });
+});
+
 describe('solids', () => {
   it('reads a box as a closed mesh with its volume', () => {
     const r = solidOf(w => box(w, [0, 0, 0], [10, 20, 30]));

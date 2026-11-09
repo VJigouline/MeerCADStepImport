@@ -73,6 +73,7 @@ Reads a STEP file into plain data, without three.js.
 | `itemId`, `itemType` | Id and type of the shape item, such as `MANIFOLD_SOLID_BREP`. |
 | `style` | `{ name, color: [r, g, b], opacity }`: sRGB colour, 0 to 1. |
 | `data` | `MeshData`: `positions`, `normals` (`Float32Array`), `indices` (`Uint32Array`), and `colors` (always `null` here). Shared between instances. |
+| `edges` | The faces' boundary loops as line segments: a `Float32Array` of point pairs in the same coordinates as `data`. An edge shared by two faces is in once, and seams are left out. `null` where there are none, as for AP242 tessellated shapes. |
 | `matrix` | Placement in the node, in metres. It includes the scale from the file's length unit, as the data is in file units. `null` for none. |
 
 ## toThree(result, options?)
@@ -90,6 +91,8 @@ Builds the three.js group from a `readStep` result. World matrices are updated, 
 | `metres` | `true` | Keep the model in metres. With `false`, it is scaled back to the file's length unit. |
 | `yUp` | `true` | Turn STEP's Z up into three.js's Y up, by rotating the root group −90° about x. |
 | `doubleSided` | `true` | Render both sides of faces, for open shells and surface models. |
+| `edges` | `true` | Add the faces' boundary loops as a `THREE.LineSegments` named "Edges" under each mesh that has them, with `userData.stepEdges` set. Faces are drawn with a small polygon offset so the lines show on them. Hide or remove them to show faces alone. |
+| `edgeColor` | `0x202020` | Colour of those lines. |
 
 Groups carry `userData.step`, a `StepUserData`:
 
