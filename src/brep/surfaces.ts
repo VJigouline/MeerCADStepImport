@@ -159,11 +159,24 @@ export class ConeSurface implements Surface {
   project(p: Vec3, hint?: Vec2): Vec2 {
     const l = local(this.frame, p);
     const rho = Math.hypot(l[0], l[1]);
-    // Nearest point on the generator line through the point's angle.
-    const u = Math.atan2(l[1], l[0]);
+    // Nearest point on a generator line in the plane through the axis and the point. Beyond the
+    // apex the radius R + v tan is negative, so a point on that nappe lies on the generator at
+    // the opposite angle: try both and keep the nearer.
+    const angle = Math.atan2(l[1], l[0]);
     const k = 1 + this.tan * this.tan;
-    const v = (l[2] + (rho - this.radius) * this.tan) / k;
-    return [nearPeriod(u, hint?.[0] ?? 0, this.uPeriod), v];
+    let best: Vec2 = [angle, 0];
+    let bestDistance = Infinity;
+    for (const side of [1, -1]) {
+      const signed = side * rho;
+      const v = (l[2] + (signed - this.radius) * this.tan) / k;
+      const r = this.radius + v * this.tan;
+      const distance = Math.hypot(signed - r, l[2] - v);
+      if (distance < bestDistance - 1e-12) {
+        bestDistance = distance;
+        best = [side > 0 ? angle : angle + Math.PI, v];
+      }
+    }
+    return [nearPeriod(best[0], hint?.[0] ?? 0, this.uPeriod), best[1]];
   }
 }
 
@@ -214,10 +227,25 @@ export class TorusSurface implements Surface {
   }
   project(p: Vec3, hint?: Vec2): Vec2 {
     const l = local(this.frame, p);
-    const u = Math.atan2(l[1], l[0]);
+    const angle = Math.atan2(l[1], l[0]);
     const rho = Math.hypot(l[0], l[1]);
-    const v = Math.atan2(l[2], rho - this.major);
-    return [nearPeriod(u, hint?.[0] ?? 0, this.uPeriod), nearPeriod(v, hint?.[1] ?? 0, this.vPeriod)];
+    // Nearest point on a meridian circle in the plane through the axis and the point. When the
+    // minor radius is larger than the major one (a spindle torus), the circle crosses the axis
+    // and R + r cos v goes negative: a point there lies on the meridian at the opposite angle.
+    // Try both and keep the nearer.
+    let best: Vec2 = [angle, Math.atan2(l[2], rho - this.major)];
+    let bestDistance = Infinity;
+    for (const side of [1, -1]) {
+      const signed = side * rho;
+      const v = Math.atan2(l[2], signed - this.major);
+      const distance = Math.abs(Math.hypot(signed - this.major, l[2]) - this.minor);
+      if (distance < bestDistance - 1e-12) {
+        bestDistance = distance;
+        best = [side > 0 ? angle : angle + Math.PI, v];
+      }
+      if (this.minor <= this.major) break;
+    }
+    return [nearPeriod(best[0], hint?.[0] ?? 0, this.uPeriod), nearPeriod(best[1], hint?.[1] ?? 0, this.vPeriod)];
   }
 }
 

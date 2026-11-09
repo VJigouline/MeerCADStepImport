@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { BSplineCurveData, BSplineSurfaceData, expandKnots } from '../src/brep/bspline.js';
 import { ConicCurve } from '../src/brep/curves.js';
 import { tessellateFace } from '../src/brep/face.js';
-import { BSplineSurface, PlaneSurface, SphereSurface } from '../src/brep/surfaces.js';
+import { BSplineSurface, ConeSurface, PlaneSurface, SphereSurface, TorusSurface, type Frame, type Surface } from '../src/brep/surfaces.js';
 import { sampleEdge } from '../src/brep/shapes.js';
 import { allMeshes, box, bsplinePatch, checkMesh, cone, cylinder, read, sphere, stepFile, StepWriter, torus } from './helpers.js';
 
@@ -58,6 +58,34 @@ describe('B-splines', () => {
       expect(pu).toBeCloseTo(u, 7);
       expect(pv).toBeCloseTo(v, 7);
     }
+  });
+});
+
+describe('surfaces past their singular points', () => {
+  const frame: Frame = { origin: [1, 2, 3], x: [1, 0, 0], y: [0, 0, -1], z: [0, 1, 0] };
+  const distance = (a: number[], b: number[]) => Math.hypot(a[0]! - b[0]!, a[1]! - b[1]!, a[2]! - b[2]!);
+  /** Every sampled point projects back onto itself. */
+  function roundTrips(surface: Surface, us: number[], vs: number[]) {
+    for (const u of us) for (const v of vs) {
+      const p = surface.evaluate(u, v)[0];
+      const [pu, pv] = surface.project(p);
+      expect(distance(surface.evaluate(pu, pv)[0], p)).toBeLessThan(1e-9);
+    }
+  }
+  const us = [0.3, 1.9, 3.5, 5.2];
+
+  it('projects onto both nappes of a cone', () => {
+    // Radius 7.5 at v = 0 and 45°: the apex is at v = -7.5, and beyond it the radius is negative.
+    const cone = new ConeSurface(frame, 7.5, Math.PI / 4);
+    roundTrips(cone, us, [-15, -12.5, -9, -6, 0, 4]);
+  });
+
+  it('projects onto a spindle torus, where the meridian crosses the axis', () => {
+    // Minor radius larger than the major one, as in a domed screw head.
+    const spindle = new TorusSurface(frame, 8.25, 54.87);
+    roundTrips(spindle, us, [0.1, 1.2, 1.6, 1.8, 2.5, 3.0, 4.4, 6.0]);
+    const ring = new TorusSurface(frame, 5, 1);
+    roundTrips(ring, us, [0.1, 1.6, 3.0, 4.4]);
   });
 });
 
