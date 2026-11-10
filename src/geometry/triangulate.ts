@@ -1,5 +1,6 @@
 // Triangulation of simple polygons with holes, by ear clipping after bridging each hole into the
-// outer boundary. Face boundaries are small, so the quadratic cost is fine.
+// outer boundary. Face boundaries can run to many thousands of points, so ears are found on a
+// linked ring and checked against a grid.
 
 import { cross, dot, normalize, perpendicular, sub, type Vec2, type Vec3 } from './math.js';
 
@@ -96,47 +97,109 @@ function bridge(ring: number[], hole: number[], points: Vec2[]): number[] {
   return [...ring.slice(0, best + 1), ...rotatedHole, hole[hi]!, ...ring.slice(best)];
 }
 
+/**
+ * Ear clipping over a linked ring: after each ear it carries on from the next vertex rather than
+ * starting again, and checks an ear only against the vertices in the grid cells under it, so
+ * boundaries of many thousands of points take about linear time.
+ */
 function earClip(ring: number[], points: Vec2[]): number[] {
+  const n = ring.length;
   const out: number[] = [];
-  const remaining = ring.slice();
-  // Each pass clips one vertex or gives up, so ring.length passes are always enough.
-  let guard = 0;
-  const limit = ring.length + 10;
-  while (remaining.length > 3 && guard < limit) {
-    guard++;
-    let clipped = false;
-    for (let i = 0; i < remaining.length; i++) {
-      const ia = remaining[(i + remaining.length - 1) % remaining.length]!, ib = remaining[i]!, ic = remaining[(i + 1) % remaining.length]!;
-      const a = points[ia]!, b = points[ib]!, c = points[ic]!;
-      const turn = cross2(a, b, c);
-      // Reflex or collinear vertices are not ears. Collinear ones are kept rather than dropped:
-      // on curved surfaces, points in a straight (u, v) line need not be in a straight 3D line, and
-      // the faces next to this one share them.
-      if (turn <= 0) continue;
-      let contains = false;
-      for (const k of remaining) {
-        if (k === ia || k === ib || k === ic) continue;
-        const p = points[k]!;
-        // Bridge vertices repeat by position; ignore copies of the ear's own corners.
-        if ((p[0] === a[0] && p[1] === a[1]) || (p[0] === b[0] && p[1] === b[1]) || (p[0] === c[0] && p[1] === c[1])) continue;
-        if (pointInTriangle(p, a, b, c)) {
-          contains = true;
-          break;
+  if (n < 3) return out;
+  // Ring positions, linked both ways.
+  const prev = new Int32Array(n), next = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    prev[i] = (i + n - 1) % n;
+    next[i] = (i + 1) % n;
+  }
+  const removed = new Uint8Array(n);
+  const P = (i: number) => points[ring[i]!]!;
+
+  // A grid of about one ring position per cell.
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const p = P(i);
+    if (p[0] < minX) minX = p[0];
+    if (p[0] > maxX) maxX = p[0];
+    if (p[1] < minY) minY = p[1];
+    if (p[1] > maxY) maxY = p[1];
+  }
+  const w = maxX - minX, h = maxY - minY;
+  let cell = Math.sqrt((w * h) / n);
+  if (!(cell > 0)) cell = Math.max(w, h) / n || 1;
+  const nx = Math.max(1, Math.min(4096, Math.ceil(w / cell) + 1)), ny = Math.max(1, Math.min(4096, Math.ceil(h / cell) + 1));
+  const cx = (x: number) => Math.min(nx - 1, Math.max(0, Math.floor(((x - minX) / (w || 1)) * (nx - 1))));
+  const cy = (y: number) => Math.min(ny - 1, Math.max(0, Math.floor(((y - minY) / (h || 1)) * (ny - 1))));
+  // Counting sort of the positions into cells.
+  const cellOf = new Int32Array(n);
+  const start = new Int32Array(nx * ny + 1);
+  for (let i = 0; i < n; i++) {
+    const p = P(i);
+    cellOf[i] = cy(p[1]) * nx + cx(p[0]);
+    start[cellOf[i]! + 1]!++;
+  }
+  for (let c = 0; c < nx * ny; c++) start[c + 1]! += start[c]!;
+  const items = new Int32Array(n);
+  const fill = start.slice(0, nx * ny);
+  for (let i = 0; i < n; i++) items[fill[cellOf[i]!]!++] = i;
+
+  const isEar = (i: number): boolean => {
+    const ia = prev[i]!, ic = next[i]!;
+    const a = P(ia), b = P(i), c = P(ic);
+    // Reflex or collinear vertices are not ears. Collinear ones are kept rather than dropped:
+    // on curved surfaces, points in a straight (u, v) line need not be in a straight 3D line, and
+    // the faces next to this one share them.
+    if (cross2(a, b, c) <= 0) return false;
+    const x0 = Math.min(a[0], b[0], c[0]), x1 = Math.max(a[0], b[0], c[0]);
+    const y0 = Math.min(a[1], b[1], c[1]), y1 = Math.max(a[1], b[1], c[1]);
+    const gx0 = cx(x0), gx1 = cx(x1), gy0 = cy(y0), gy1 = cy(y1);
+    for (let gy = gy0; gy <= gy1; gy++) {
+      for (let gx = gx0; gx <= gx1; gx++) {
+        const g = gy * nx + gx;
+        for (let s = start[g]!; s < start[g + 1]!; s++) {
+          const k = items[s]!;
+          if (removed[k] || k === ia || k === i || k === ic) continue;
+          const p = P(k);
+          if (p[0] < x0 || p[0] > x1 || p[1] < y0 || p[1] > y1) continue;
+          // Bridge vertices repeat by position; ignore copies of the ear's own corners.
+          if ((p[0] === a[0] && p[1] === a[1]) || (p[0] === b[0] && p[1] === b[1]) || (p[0] === c[0] && p[1] === c[1])) continue;
+          if (pointInTriangle(p, a, b, c)) return false;
         }
       }
-      if (contains) continue;
-      out.push(ia, ib, ic);
-      remaining.splice(i, 1);
-      clipped = true;
-      break;
     }
-    if (!clipped) {
-      // Self-intersecting or numerically awkward input: fan out what's left.
-      for (let i = 1; i + 1 < remaining.length; i++) out.push(remaining[0]!, remaining[i]!, remaining[i + 1]!);
+    return true;
+  };
+
+  let remaining = n;
+  let ear = 0, stop = 0;
+  while (remaining > 3) {
+    if (isEar(ear)) {
+      const ia = prev[ear]!, ic = next[ear]!;
+      out.push(ring[ia]!, ring[ear]!, ring[ic]!);
+      removed[ear] = 1;
+      next[ia] = ic;
+      prev[ic] = ia;
+      remaining--;
+      // Carry on from the vertex before, which may have become an ear.
+      ear = ia;
+      stop = ia;
+      continue;
+    }
+    ear = next[ear]!;
+    if (ear === stop) {
+      // Round the whole ring without an ear: self-intersecting or numerically awkward input.
+      // Fan out what's left.
+      const rest: number[] = [];
+      let k = ear;
+      do {
+        rest.push(ring[k]!);
+        k = next[k]!;
+      } while (k !== ear);
+      for (let i = 1; i + 1 < rest.length; i++) out.push(rest[0]!, rest[i]!, rest[i + 1]!);
       return out;
     }
   }
-  if (remaining.length === 3) out.push(remaining[0]!, remaining[1]!, remaining[2]!);
+  out.push(ring[prev[ear]!]!, ring[ear]!, ring[next[ear]!]!);
   return out;
 }
 

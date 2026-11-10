@@ -483,8 +483,20 @@ function cleanRing(ring: BoundaryPoint[], su: number, sv: number, eps: number): 
   return out;
 }
 
+/** Twice the signed area of (a, b, c): positive when counter-clockwise. */
+function orient2(ax: number, ay: number, bx: number, by: number, cx: number, cy: number): number {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+/**
+ * A triangle mesh in (u, v) being refined towards the surface. Triangles are kept with their
+ * neighbours across each edge, so finding, flipping and splitting edges takes constant time.
+ */
 class Refiner {
   uv: Vec2[] = [];
+  /** (u, v) scaled by (su, sv), in which the mesh is made Delaunay. */
+  private readonly x: number[] = [];
+  private readonly y: number[] = [];
   /** Output positions: the exact edge points on the boundary, surface points inside. */
   p: Vec3[] = [];
   /** Surface points at each vertex's (u, v), for measuring how flat the surface is. */
@@ -492,26 +504,78 @@ class Refiner {
   n: (Vec3 | null)[] = [];
   /** 1 where u is undefined (a pole, where du is zero), 2 where v is, 0 elsewhere. */
   singular: number[] = [];
-  /** Triangles, three vertex indices each, counter-clockwise in (u, v); -1 for removed ones. */
+  /** Triangles, three vertex indices each, counter-clockwise in (u, v). */
   tris: number[] = [];
-  private edges = new Map<number, number[]>();
-  boundary = new Set<number>();
+  /**
+   * The triangle across each edge: adj[t * 3 + k] is across the edge from vertex k to vertex
+   * k + 1 of triangle t, or -1 for none.
+   */
+  private readonly adj: number[] = [];
+  /** A triangle at each vertex, to start walks round it from. */
+  private readonly vtri: number[] = [];
+  /** For a boundary vertex, the next one along its ring; the edges between them stay as they are. */
+  private readonly ringNext: number[] = [];
+  /** Triangles changed since the last flipAll, and a flag for each so it is listed once. */
+  private dirty: number[] = [];
+  private readonly dirtyFlag: number[] = [];
+  private dirtyAll = true;
+  private lastFound = 0;
 
   constructor(readonly surface: Surface, readonly su: number, readonly sv: number) {}
-
-  key(a: number, b: number): number {
-    return a < b ? a * 0x4000000 + b : b * 0x4000000 + a;
-  }
 
   addVertex(uv: Vec2, p?: Vec3): number {
     const [point, du, dv] = this.surface.evaluate(uv[0], uv[1]);
     this.uv.push(uv);
+    this.x.push(uv[0] * this.su);
+    this.y.push(uv[1] * this.sv);
     this.p.push(p ?? point);
     this.q.push(point);
     this.n.push(surfaceNormal(du, dv));
     const lu = length(du), lv = length(dv);
     this.singular.push(lu <= 1e-9 * lv ? 1 : lv <= 1e-9 * lu ? 2 : 0);
+    this.vtri.push(-1);
     return this.uv.length - 1;
+  }
+
+  /** Marks the edge from a to b as part of a boundary ring. */
+  addBoundaryEdge(a: number, b: number): void {
+    this.ringNext[a] = b;
+  }
+
+  isBoundary(a: number, b: number): boolean {
+    return this.ringNext[a] === b || this.ringNext[b] === a;
+  }
+
+  /** Adds a triangle of the starting triangulation; `link` then finds the neighbours. */
+  addTriangle(a: number, b: number, c: number): void {
+    this.tris.push(a, b, c);
+    this.adj.push(-1, -1, -1);
+  }
+
+  /**
+   * Finds each triangle's neighbours in the starting triangulation. An edge with more than two
+   * triangles, or two the same way round, as degenerate input can give, has none.
+   */
+  link(): void {
+    const count = this.uv.length;
+    const half = new Map<number, number>();
+    const bad = new Set<number>();
+    for (let t = 0; t < this.triangleCount; t++) {
+      for (let k = 0; k < 3; k++) {
+        const a = this.tris[t * 3 + k]!, b = this.tris[t * 3 + ((k + 1) % 3)]!;
+        const key = a * count + b;
+        if (half.has(key)) bad.add(key);
+        else half.set(key, t * 3 + k);
+        this.vtri[a] = t;
+      }
+    }
+    for (const [key, h] of half) {
+      const a = Math.floor(key / count), b = key - a * count;
+      const reverse = b * count + a;
+      const other = half.get(reverse);
+      if (other === undefined || bad.has(key) || bad.has(reverse)) continue;
+      this.adj[h] = Math.floor(other / 3);
+    }
   }
 
   /**
@@ -529,64 +593,13 @@ class Refiner {
     return [u, v];
   }
 
-  private link(t: number): void {
-    for (let k = 0; k < 3; k++) {
-      const a = this.tris[t * 3 + k]!, b = this.tris[t * 3 + ((k + 1) % 3)]!;
-      const key = this.key(a, b);
-      const list = this.edges.get(key);
-      if (list) list.push(t);
-      else this.edges.set(key, [t]);
-    }
-  }
-
-  private unlink(t: number): void {
-    for (let k = 0; k < 3; k++) {
-      const a = this.tris[t * 3 + k]!, b = this.tris[t * 3 + ((k + 1) % 3)]!;
-      const key = this.key(a, b);
-      const list = this.edges.get(key);
-      if (!list) continue;
-      const i = list.indexOf(t);
-      if (i >= 0) list.splice(i, 1);
-      if (list.length === 0) this.edges.delete(key);
-    }
-  }
-
-  addTriangle(a: number, b: number, c: number): number {
-    const t = this.tris.length / 3;
-    this.tris.push(a, b, c);
-    this.link(t);
-    this.touch(t);
-    return t;
-  }
-
-  private replace(t: number, a: number, b: number, c: number): void {
-    this.unlink(t);
-    this.tris[t * 3] = a;
-    this.tris[t * 3 + 1] = b;
-    this.tris[t * 3 + 2] = c;
-    this.link(t);
-    this.touch(t);
-  }
-
   get triangleCount(): number {
     return this.tris.length / 3;
   }
 
-  private s(i: number): Vec2 {
-    const uv = this.uv[i]!;
-    return [uv[0] * this.su, uv[1] * this.sv];
-  }
-
   private orient(a: number, b: number, c: number): number {
-    const A = this.s(a), B = this.s(b), C = this.s(c);
-    return (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0]);
-  }
-
-  /** orient() with a point given by its (u, v) in place of one or two vertices. */
-  private orientAt(a: number | Vec2, b: number | Vec2, c: number | Vec2): number {
-    const s = (x: number | Vec2): Vec2 => (typeof x === 'number' ? this.s(x) : [x[0] * this.su, x[1] * this.sv]);
-    const A = s(a), B = s(b), C = s(c);
-    return (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0]);
+    const x = this.x, y = this.y;
+    return orient2(x[a]!, y[a]!, x[b]!, y[b]!, x[c]!, y[c]!);
   }
 
   /** The vertex of triangle t opposite edge (a, b). */
@@ -598,23 +611,133 @@ class Refiner {
     return -1;
   }
 
-  /** Whether (a, b) runs a -> b in triangle t. */
-  private forward(t: number, a: number, b: number): boolean {
-    for (let k = 0; k < 3; k++) if (this.tris[t * 3 + k] === a && this.tris[t * 3 + ((k + 1) % 3)] === b) return true;
-    return false;
+  /** The slot of triangle t whose edge runs from a to b, or -1. */
+  private slot(t: number, a: number, b: number): number {
+    const i = t * 3, tr = this.tris;
+    if (tr[i] === a && tr[i + 1] === b) return 0;
+    if (tr[i + 1] === a && tr[i + 2] === b) return 1;
+    if (tr[i + 2] === a && tr[i] === b) return 2;
+    return -1;
+  }
+
+  /** The half-edge (t * 3 + k) running from a to b, found by walking round a, or -1. */
+  private halfEdge(a: number, b: number): number {
+    const start = this.vtri[a] ?? -1;
+    if (start < 0) return -1;
+    const tr = this.tris;
+    const limit = this.triangleCount + 1;
+    // Round a one way, across the edge coming into a...
+    let t = start;
+    for (let steps = 0; steps < limit; steps++) {
+      const k = tr[t * 3] === a ? 0 : tr[t * 3 + 1] === a ? 1 : tr[t * 3 + 2] === a ? 2 : -1;
+      if (k < 0) return -1;
+      if (tr[t * 3 + ((k + 1) % 3)] === b) return t * 3 + k;
+      t = this.adj[t * 3 + ((k + 2) % 3)]!;
+      if (t < 0) break;
+      if (t === start) return -1;
+    }
+    // ...and, from the mesh's edge, the other way, across the edge leaving a.
+    t = start;
+    for (let steps = 0; steps < limit; steps++) {
+      const k = tr[t * 3] === a ? 0 : tr[t * 3 + 1] === a ? 1 : tr[t * 3 + 2] === a ? 2 : -1;
+      if (k < 0) return -1;
+      t = this.adj[t * 3 + k]!;
+      if (t < 0 || t === start) return -1;
+      const j = tr[t * 3] === a ? 0 : tr[t * 3 + 1] === a ? 1 : tr[t * 3 + 2] === a ? 2 : -1;
+      if (j >= 0 && tr[t * 3 + ((j + 1) % 3)] === b) return t * 3 + j;
+    }
+    return -1;
+  }
+
+  private hasEdge(a: number, b: number): boolean {
+    return this.halfEdge(a, b) >= 0 || this.halfEdge(b, a) >= 0;
+  }
+
+  private markDirty(t: number): void {
+    if (this.dirtyFlag[t]) return;
+    this.dirtyFlag[t] = 1;
+    this.dirty.push(t);
+  }
+
+  /**
+   * Replaces triangles and adds new ones (t = -1), then links them to each other and to the
+   * unchanged triangles that were next to the replaced ones. Returns the triangles' indices.
+   */
+  private rewrite(changes: [number, number, number, number][]): number[] {
+    const tr = this.tris, adj = this.adj;
+    const set: number[] = [];
+    // The unchanged neighbours, by the edge they share as it ran in the old triangle.
+    const outer: number[] = [];
+    for (const [t] of changes) if (t >= 0) set.push(t);
+    for (const t of set) {
+      for (let k = 0; k < 3; k++) {
+        const nb = adj[t * 3 + k]!;
+        if (nb >= 0 && !set.includes(nb)) outer.push(tr[t * 3 + k]!, tr[t * 3 + ((k + 1) % 3)]!, nb);
+      }
+    }
+    const ids: number[] = [];
+    for (const [t0, a, b, c] of changes) {
+      let t = t0;
+      if (t < 0) {
+        t = this.triangleCount;
+        tr.push(a, b, c);
+        adj.push(-1, -1, -1);
+        set.push(t);
+      } else {
+        tr[t * 3] = a;
+        tr[t * 3 + 1] = b;
+        tr[t * 3 + 2] = c;
+      }
+      ids.push(t);
+    }
+    for (const t of set) {
+      for (let k = 0; k < 3; k++) {
+        const p = tr[t * 3 + k]!, q = tr[t * 3 + ((k + 1) % 3)]!;
+        let nb = -1;
+        for (const s of set) {
+          if (s !== t && this.slot(s, q, p) >= 0) {
+            nb = s;
+            break;
+          }
+        }
+        if (nb < 0) {
+          for (let i = 0; i < outer.length; i += 3) {
+            if (outer[i] === p && outer[i + 1] === q) {
+              nb = outer[i + 2]!;
+              const j = this.slot(nb, q, p);
+              if (j >= 0) adj[nb * 3 + j] = t;
+              else nb = -1;
+              break;
+            }
+          }
+        }
+        adj[t * 3 + k] = nb;
+        this.vtri[p] = t;
+      }
+      this.markDirty(t);
+    }
+    return ids;
   }
 
   /** Splits edge (a, b) at its (u, v) midpoint, and each triangle on it in two. */
   splitEdge(a: number, b: number): boolean {
-    const key = this.key(a, b);
-    const list = this.edges.get(key);
-    if (!list || list.length === 0 || this.boundary.has(key)) return false;
+    if (this.isBoundary(a, b)) return false;
+    let h = this.halfEdge(a, b);
+    if (h < 0) h = this.halfEdge(b, a);
+    if (h < 0) return false;
+    const t1 = Math.floor(h / 3);
+    const x = this.tris[h]!, y = this.tris[t1 * 3 + (((h % 3) + 1) % 3)]!;
+    const c1 = this.tris[t1 * 3 + (((h % 3) + 2) % 3)]!;
+    const t2 = this.adj[h]!;
+    const c2 = t2 >= 0 ? this.opposite(t2, x, y) : -1;
     // The new vertex must be strictly inside both triangles on the edge, or they would fold.
-    const fits = (uv: Vec2) => list.every(t => {
-      const [x, y] = this.forward(t, a, b) ? [a, b] : [b, a];
-      const c = this.opposite(t, x, y);
-      return this.orientAt(x, uv, c) > 0 && this.orientAt(uv, y, c) > 0;
-    });
+    const X = this.x, Y = this.y;
+    const fits = (uv: Vec2) => {
+      const mx = uv[0] * this.su, my = uv[1] * this.sv;
+      if (!(orient2(X[x]!, Y[x]!, mx, my, X[c1]!, Y[c1]!) > 0 && orient2(mx, my, X[y]!, Y[y]!, X[c1]!, Y[c1]!) > 0)) return false;
+      // In the other triangle the edge runs from y to x.
+      return c2 < 0 || (orient2(X[y]!, Y[y]!, mx, my, X[c2]!, Y[c2]!) > 0 && orient2(mx, my, X[x]!, Y[x]!, X[c2]!, Y[c2]!) > 0);
+    };
     let uv = this.midpoint(a, b);
     if (!fits(uv)) {
       const ua = this.uv[a]!, ub = this.uv[b]!;
@@ -622,12 +745,9 @@ class Refiner {
       if (!fits(uv)) return false;
     }
     const m = this.addVertex(uv);
-    for (const t of list.slice()) {
-      const [x, y] = this.forward(t, a, b) ? [a, b] : [b, a];
-      const c = this.opposite(t, x, y);
-      this.replace(t, x, m, c);
-      this.addTriangle(m, y, c);
-    }
+    const changes: [number, number, number, number][] = [[t1, x, m, c1], [-1, m, y, c1]];
+    if (t2 >= 0) changes.push([t2, y, m, c2], [-1, m, x, c2]);
+    this.rewrite(changes);
     return true;
   }
 
@@ -635,9 +755,7 @@ class Refiner {
   splitTriangle(t: number, uv: Vec2): void {
     const a = this.tris[t * 3]!, b = this.tris[t * 3 + 1]!, c = this.tris[t * 3 + 2]!;
     const m = this.addVertex(uv);
-    this.replace(t, a, b, m);
-    this.addTriangle(b, c, m);
-    this.addTriangle(c, a, m);
+    this.rewrite([[t, a, b, m], [-1, b, c, m], [-1, c, a, m]]);
   }
 
   /**
@@ -647,16 +765,17 @@ class Refiner {
   insert(uv: Vec2): boolean {
     const count = this.triangleCount;
     if (count === 0) return false;
+    const px = uv[0] * this.su, py = uv[1] * this.sv;
+    const X = this.x, Y = this.y, tr = this.tris;
     let t = this.lastFound < count ? this.lastFound : 0;
     for (let steps = 0; steps < count + 8; steps++) {
       let moved = false;
       for (let k = 0; k < 3; k++) {
-        const a = this.tris[t * 3 + k]!, b = this.tris[t * 3 + ((k + 1) % 3)]!;
-        if (this.orientAt(a, b, uv) >= 0) continue;
+        const a = tr[t * 3 + k]!, b = tr[t * 3 + ((k + 1) % 3)]!;
+        if (orient2(X[a]!, Y[a]!, X[b]!, Y[b]!, px, py) >= 0) continue;
         // The point is beyond edge (a, b): step to the triangle on the other side, if any.
-        const list = this.edges.get(this.key(a, b));
-        const other = list?.find(x => x !== t);
-        if (other === undefined) return this.insertSlow(uv);
+        const other = this.adj[t * 3 + k]!;
+        if (other < 0) return this.insertSlow(uv);
         t = other;
         moved = true;
         break;
@@ -669,100 +788,121 @@ class Refiner {
     return this.insertSlow(uv);
   }
 
-  private lastFound = 0;
-
   private insertSlow(uv: Vec2): boolean {
+    const px = uv[0] * this.su, py = uv[1] * this.sv;
+    const X = this.x, Y = this.y, tr = this.tris;
     for (let t = 0; t < this.triangleCount; t++) {
-      const a = this.tris[t * 3]!, b = this.tris[t * 3 + 1]!, c = this.tris[t * 3 + 2]!;
-      if (this.orientAt(a, b, uv) > 0 && this.orientAt(b, c, uv) > 0 && this.orientAt(c, a, uv) > 0) return this.splitAt(t, uv);
+      const a = tr[t * 3]!, b = tr[t * 3 + 1]!, c = tr[t * 3 + 2]!;
+      if (orient2(X[a]!, Y[a]!, X[b]!, Y[b]!, px, py) > 0 && orient2(X[b]!, Y[b]!, X[c]!, Y[c]!, px, py) > 0 && orient2(X[c]!, Y[c]!, X[a]!, Y[a]!, px, py) > 0) {
+        return this.splitAt(t, uv);
+      }
     }
     return false;
   }
 
   private splitAt(t: number, uv: Vec2): boolean {
-    const a = this.tris[t * 3]!, b = this.tris[t * 3 + 1]!, c = this.tris[t * 3 + 2]!;
-    const area = this.orient(a, b, c);
-    const eps = 1e-6 * Math.abs(area);
-    if (this.orientAt(a, b, uv) <= eps || this.orientAt(b, c, uv) <= eps || this.orientAt(c, a, uv) <= eps) return false;
+    const px = uv[0] * this.su, py = uv[1] * this.sv;
+    const X = this.x, Y = this.y, tr = this.tris;
+    const a = tr[t * 3]!, b = tr[t * 3 + 1]!, c = tr[t * 3 + 2]!;
+    const eps = 1e-6 * Math.abs(this.orient(a, b, c));
+    if (orient2(X[a]!, Y[a]!, X[b]!, Y[b]!, px, py) <= eps || orient2(X[b]!, Y[b]!, X[c]!, Y[c]!, px, py) <= eps || orient2(X[c]!, Y[c]!, X[a]!, Y[a]!, px, py) <= eps) return false;
     this.splitTriangle(t, uv);
     return true;
   }
 
-  /** Lawson flips towards a Delaunay triangulation in scaled (u, v). */
-  /** Edges whose Delaunay condition may no longer hold: the edges of changed triangles. */
-  private dirty = new Set<number>();
-  private dirtyAll = true;
-
-  private touch(t: number): void {
-    for (let k = 0; k < 3; k++) this.dirty.add(this.key(this.tris[t * 3 + k]!, this.tris[t * 3 + ((k + 1) % 3)]!));
-  }
-
   /**
-   * Lawson flips towards a Delaunay triangulation in scaled (u, v), checking only edges near the
-   * triangles changed since the last call (all of them the first time).
+   * Lawson flips to the constrained Delaunay triangulation in scaled (u, v), checking only the
+   * triangles changed since the last call (all of them the first time). Flipping runs until it
+   * is done: long thin faces need many rounds, and a mesh left part way gives the refinement
+   * long slivers to split. inCircle's margin keeps flips from cycling; the count is a backstop.
    */
-  flipAll(limit: number): void {
-    let queue = this.dirtyAll ? [...this.edges.keys()] : [...this.dirty];
-    this.dirtyAll = false;
-    this.dirty.clear();
-    for (let pass = 0; pass < limit && queue.length; pass++) {
-      const next = new Set<number>();
-      for (const key of queue) {
-        const list = this.edges.get(key);
-        if (!list || list.length !== 2 || this.boundary.has(key)) continue;
-        const [t1, t2] = list as [number, number];
-        let a = -1, b = -1;
+  flipAll(): void {
+    let queue: number[];
+    if (this.dirtyAll) {
+      queue = Array.from({ length: this.triangleCount }, (_, t) => t);
+      this.dirtyAll = false;
+    } else {
+      queue = this.dirty;
+    }
+    for (const t of this.dirty) this.dirtyFlag[t] = 0;
+    this.dirty = [];
+    let budget = 64 * this.triangleCount + 1024;
+    while (queue.length && budget > 0) {
+      for (const t of queue) {
         for (let k = 0; k < 3; k++) {
-          const x = this.tris[t1 * 3 + k]!, y = this.tris[t1 * 3 + ((k + 1) % 3)]!;
-          if (this.key(x, y) === key) {
-            a = x;
-            b = y;
+          if (this.flip(t, k)) {
+            budget--;
+            break;
           }
         }
-        if (a < 0) continue;
-        const c = this.opposite(t1, a, b), d = this.opposite(t2, a, b);
-        if (c < 0 || d < 0 || c === d) continue;
-        if (!this.inCircle(a, b, c, d)) continue;
-        // The flipped triangles must both stay counter-clockwise.
-        if (this.orient(c, a, d) <= 0 || this.orient(d, b, c) <= 0) continue;
-        if (this.edges.has(this.key(c, d))) continue;
-        this.replace(t1, c, a, d);
-        this.replace(t2, d, b, c);
-        // The quad's outer edges may now need flipping.
-        for (const [x, y] of [[c, a], [a, d], [d, b], [b, c]] as const) next.add(this.key(x, y));
       }
-      queue = [...next];
+      // Flipped triangles were marked dirty: their other edges may now need flipping.
+      queue = this.dirty;
+      for (const t of queue) this.dirtyFlag[t] = 0;
+      this.dirty = [];
     }
-    this.dirty.clear();
+  }
+
+  /** Flips the edge in slot k of triangle t if the triangles on it aren't Delaunay. */
+  private flip(t1: number, k1: number): boolean {
+    const t2 = this.adj[t1 * 3 + k1]!;
+    if (t2 < 0) return false;
+    const tr = this.tris;
+    const a = tr[t1 * 3 + k1]!, b = tr[t1 * 3 + ((k1 + 1) % 3)]!;
+    if (this.isBoundary(a, b)) return false;
+    const k2 = this.slot(t2, b, a);
+    if (k2 < 0) return false;
+    const c = tr[t1 * 3 + ((k1 + 2) % 3)]!, d = tr[t2 * 3 + ((k2 + 2) % 3)]!;
+    if (c === d) return false;
+    if (!this.inCircle(a, b, c, d)) return false;
+    // The flipped triangles must both stay counter-clockwise.
+    if (this.orient(c, a, d) <= 0 || this.orient(d, b, c) <= 0) return false;
+    if (this.hasEdge(c, d)) return false;
+    this.rewrite([[t1, c, a, d], [t2, d, b, c]]);
+    return true;
   }
 
   private inCircle(a: number, b: number, c: number, d: number): boolean {
-    const A = this.s(a), B = this.s(b), C = this.s(c), D = this.s(d);
-    const ax = A[0] - D[0], ay = A[1] - D[1], bx = B[0] - D[0], by = B[1] - D[1], cx = C[0] - D[0], cy = C[1] - D[1];
+    const X = this.x, Y = this.y;
+    const ax = X[a]! - X[d]!, ay = Y[a]! - Y[d]!, bx = X[b]! - X[d]!, by = Y[b]! - Y[d]!, cx = X[c]! - X[d]!, cy = Y[c]! - Y[d]!;
     const det = (ax * ax + ay * ay) * (bx * cy - cx * by) - (bx * bx + by * by) * (ax * cy - cx * ay) + (cx * cx + cy * cy) * (ax * by - bx * ay);
     const scale = (ax * ax + ay * ay + bx * bx + by * by + cx * cx + cy * cy) ** 2;
     return det > 1e-12 * scale;
+  }
+
+  /** The other half of half-edge h, in the triangle across it, or -1. */
+  private twin(h: number): number {
+    const nb = this.adj[h]!;
+    if (nb < 0) return -1;
+    const t = Math.floor(h / 3), k = h % 3;
+    const j = this.slot(nb, this.tris[t * 3 + ((k + 1) % 3)]!, this.tris[h]!);
+    return j < 0 ? -1 : nb * 3 + j;
   }
 
   /** One pass of refinement: splits edges and triangles that are too far from the surface. */
   refinePass(options: FaceOptions): number {
     // Diagonals across a boundary step turn by up to about √2 times the step's angle.
     const cosAngle = Math.cos(Math.min(Math.PI / 2, options.angle * 1.5));
+    const tr = this.tris;
+    const count = this.triangleCount;
+    // Each edge's error, measured once for both its triangles; -1 for not yet.
+    const errors = new Float64Array(count * 3).fill(-1);
+    // Edges to split, by the lower of their two half-edges.
     const edgeSplits = new Map<number, [number, number, number]>();
     const triangleSplits: [number, Vec2][] = [];
-    const count = this.triangleCount;
     for (let t = 0; t < count; t++) {
-      const v = [this.tris[t * 3]!, this.tris[t * 3 + 1]!, this.tris[t * 3 + 2]!] as const;
+      const v0 = tr[t * 3]!, v1 = tr[t * 3 + 1]!, v2 = tr[t * 3 + 2]!;
       let worstEdge = -1, worst = 0;
       for (let k = 0; k < 3; k++) {
-        const a = v[k]!, b = v[(k + 1) % 3]!;
-        const key = this.key(a, b);
-        if (this.boundary.has(key)) continue;
-        const already = edgeSplits.get(key);
-        let error: number;
-        if (already) error = already[2];
-        else {
+        const a = tr[t * 3 + k]!, b = tr[t * 3 + ((k + 1) % 3)]!;
+        if (this.isBoundary(a, b)) continue;
+        const h = t * 3 + k;
+        let error = errors[h]!;
+        if (error < 0) {
           error = this.edgeError(a, b, options, cosAngle);
+          errors[h] = error;
+          const other = this.twin(h);
+          if (other >= 0) errors[other] = error;
         }
         if (error > worst) {
           worst = error;
@@ -770,16 +910,18 @@ class Refiner {
         }
       }
       if (worstEdge >= 0 && worst > 1) {
-        const a = v[worstEdge]!, b = v[(worstEdge + 1) % 3]!;
-        edgeSplits.set(this.key(a, b), [a, b, worst]);
+        const h = t * 3 + worstEdge, other = this.twin(h);
+        const a = tr[h]!, b = tr[t * 3 + ((worstEdge + 1) % 3)]!;
+        edgeSplits.set(other >= 0 ? Math.min(h, other) : h, [a, b, worst]);
         continue;
       }
       // Edges are fine: check the middle of the triangle.
-      const uv: Vec2 = [(this.uv[v[0]]![0] + this.uv[v[1]]![0] + this.uv[v[2]]![0]) / 3, (this.uv[v[0]]![1] + this.uv[v[1]]![1] + this.uv[v[2]]![1]) / 3];
+      const ua = this.uv[v0]!, ub = this.uv[v1]!, uc = this.uv[v2]!;
+      const uv: Vec2 = [(ua[0] + ub[0] + uc[0]) / 3, (ua[1] + ub[1] + uc[1]) / 3];
       const s = this.surface.evaluate(uv[0], uv[1])[0];
       // Against the surface's own points: boundary points may be off the surface by the file's
       // modelling tolerance, and no amount of splitting closes that gap.
-      const pa = this.q[v[0]]!, pb = this.q[v[1]]!, pc = this.q[v[2]]!;
+      const pa = this.q[v0]!, pb = this.q[v1]!, pc = this.q[v2]!;
       const normal = cross(sub(pb, pa), sub(pc, pa));
       const nl = length(normal);
       const deviation = nl > 0 ? Math.abs(dot(sub(s, pa), normal)) / nl : 0;
@@ -787,8 +929,8 @@ class Refiner {
         // Split the longest interior edge, or the triangle itself if all its edges are boundary.
         let longest = -1, longestLength = 0;
         for (let k = 0; k < 3; k++) {
-          const a = v[k]!, b = v[(k + 1) % 3]!;
-          if (this.boundary.has(this.key(a, b))) continue;
+          const a = tr[t * 3 + k]!, b = tr[t * 3 + ((k + 1) % 3)]!;
+          if (this.isBoundary(a, b)) continue;
           const l = length(sub(this.q[a]!, this.q[b]!));
           if (l > longestLength) {
             longestLength = l;
@@ -796,8 +938,9 @@ class Refiner {
           }
         }
         if (longest >= 0) {
-          const a = v[longest]!, b = v[(longest + 1) % 3]!;
-          if (!edgeSplits.has(this.key(a, b))) edgeSplits.set(this.key(a, b), [a, b, deviation / (options.tolerance * INTERIOR_MARGIN)]);
+          const h = t * 3 + longest, other = this.twin(h);
+          const id = other >= 0 ? Math.min(h, other) : h;
+          if (!edgeSplits.has(id)) edgeSplits.set(id, [tr[h]!, tr[t * 3 + ((longest + 1) % 3)]!, deviation / (options.tolerance * INTERIOR_MARGIN)]);
         } else {
           triangleSplits.push([t, uv]);
         }
@@ -968,6 +1111,7 @@ function seedInterior(refiner: Refiner, outer: BoundaryPoint[], holes: BoundaryP
   }
 }
 
+
 function meshRegion(surface: Surface, sense: boolean, region: Region, options: FaceOptions, out: FaceMesh): void {
   // Scale (u, v) by the surface's average speed in each direction so the domain is close to
   // isometric, which keeps the triangles' shapes sensible in 3D.
@@ -1025,7 +1169,7 @@ function meshRegion(surface: Surface, sense: boolean, region: Region, options: F
     for (const p of ring) refiner.addVertex(p.uv, p.p);
   }
   rings.forEach((ring, r) => {
-    for (let i = 0; i < ring.length; i++) refiner.boundary.add(refiner.key(ringStart[r]! + i, ringStart[r]! + ((i + 1) % ring.length)));
+    for (let i = 0; i < ring.length; i++) refiner.addBoundaryEdge(ringStart[r]! + i, ringStart[r]! + ((i + 1) % ring.length));
   });
   const scaled = (ring: BoundaryPoint[]) => ring.map(p => [p.uv[0] * su, p.uv[1] * sv] as Vec2);
   const triangles = triangulate(scaled(outer), holes.map(scaled));
@@ -1034,14 +1178,15 @@ function meshRegion(surface: Surface, sense: boolean, region: Region, options: F
     if (a === b || b === c || a === c) continue;
     refiner.addTriangle(a, b, c);
   }
-  refiner.flipAll(200);
+  refiner.link();
+  refiner.flipAll();
   if (!surface.planar) {
     seedInterior(refiner, outer, holes, steps, options);
-    refiner.flipAll(200);
+    refiner.flipAll();
     for (let pass = 0; pass < 24; pass++) {
       if (refiner.triangleCount >= options.maxTriangles) break;
       if (refiner.refinePass(options) === 0) break;
-      refiner.flipAll(200);
+      refiner.flipAll();
     }
   }
   emit(refiner, sense, out);

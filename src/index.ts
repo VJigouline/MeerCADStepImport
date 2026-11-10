@@ -1,8 +1,11 @@
 import type * as THREE from 'three';
-import { readStep, type StepImportOptions, type StepImportResult } from './importer.js';
+import { readStep, readStepAsync, type StepImportOptions, type StepImportResult } from './importer.js';
+import type { StepWorkerOptions } from './parallel.js';
 import { toThree, type StepThreeOptions } from './three.js';
 
-export { readStep } from './importer.js';
+export { readStep, readStepAsync } from './importer.js';
+export { runStepWorker, defaultWorkerCount } from './parallel.js';
+export type { StepWorkerLike, StepWorkerOptions, StepWorkerScope } from './parallel.js';
 export type { StepImportOptions, StepImportResult, StepNode, StepMesh, StepProduct } from './importer.js';
 export { toThree } from './three.js';
 export type { StepThreeOptions, StepUserData, StepMeshUserData } from './three.js';
@@ -41,8 +44,16 @@ export async function decompressStep(input: ArrayBuffer | Uint8Array): Promise<U
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-/** Like loadStep, and also reads gzip-compressed files (.stpz). */
-export async function loadStepAsync(input: string | ArrayBuffer | Uint8Array, options: StepImportOptions & StepThreeOptions = {}): Promise<StepLoadResult> {
+/**
+ * Like loadStep, and also reads gzip-compressed files (.stpz). With `workers`, the tessellation
+ * is spread over web workers whose script calls `runStepWorker()`, which is several times faster
+ * for large files and leaves the page responsive meanwhile.
+ */
+export async function loadStepAsync(
+  input: string | ArrayBuffer | Uint8Array,
+  options: StepImportOptions & StepThreeOptions & { workers?: StepWorkerOptions } = {},
+): Promise<StepLoadResult> {
   const data = typeof input !== 'string' && isGzip(input) ? await decompressStep(input) : input;
-  return loadStep(data, options);
+  const result = await readStepAsync(data, options);
+  return { ...result, group: toThree(result, options) };
 }

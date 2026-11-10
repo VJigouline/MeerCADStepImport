@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { BSplineCurveData, BSplineSurfaceData, expandKnots } from '../src/brep/bspline.js';
-import { ConicCurve } from '../src/brep/curves.js';
+import { BSplineCurve, ConicCurve } from '../src/brep/curves.js';
 import { tessellateFace } from '../src/brep/face.js';
 import { BSplineSurface, ConeSurface, PlaneSurface, SphereSurface, TorusSurface, type Frame, type Surface } from '../src/brep/surfaces.js';
 import { sampleEdge } from '../src/brep/shapes.js';
@@ -107,6 +107,37 @@ describe('edges', () => {
     expect(forward[forward.length - 1]).toEqual([0, 10, 0]);
     const closed = sampleEdge(circle, [10, 0, 0], [10, 0, 0], true, true, options);
     expect(closed.length).toBeGreaterThan(30);
+  });
+
+  it('samples a B-spline with many knots by the tolerances, not by its knots', () => {
+    // A cubic through 203 control points round a quarter circle of radius 10: 200 knot spans.
+    const spans = 200;
+    const points: [number, number, number][] = [];
+    for (let i = 0; i < spans + 3; i++) {
+      const a = (Math.PI / 2) * (i / (spans + 2));
+      points.push([10 * Math.cos(a), 10 * Math.sin(a), 0]);
+    }
+    const knots = Array.from({ length: spans + 1 }, (_, i) => i / spans);
+    const multiplicities = knots.map((_, i) => (i === 0 || i === spans ? 4 : 1));
+    const curve = new BSplineCurve(new BSplineCurveData(3, points, expandKnots(multiplicities, knots), null));
+    const options = { tolerance: 0.01, angle: 0.2, maxTriangles: 1e4 };
+    const start = curve.point(0), end = curve.point(1);
+    const sampled = sampleEdge(curve, start, end, false, true, options);
+    // About what the circle needs (18 segments), not three points a knot span.
+    expect(sampled.length).toBeLessThan(40);
+    expect(sampled[0]).toEqual(start);
+    expect(sampled[sampled.length - 1]).toEqual(end);
+    // Every point of the curve is within the tolerance of the chord it falls under.
+    const ts = sampled.map(p => curve.closest(p));
+    for (let i = 1; i < ts.length; i++) {
+      const a = sampled[i - 1]!, b = sampled[i]!;
+      const chord = [b[0] - a[0], b[1] - a[1]], cl = Math.hypot(chord[0]!, chord[1]!);
+      for (let k = 1; k < 10; k++) {
+        const p = curve.point(ts[i - 1]! + ((ts[i]! - ts[i - 1]!) * k) / 10);
+        const d = Math.abs((p[0] - a[0]) * chord[1]! - (p[1] - a[1]) * chord[0]!) / cl;
+        expect(d).toBeLessThanOrEqual(options.tolerance * 1.05);
+      }
+    }
   });
 });
 

@@ -32,6 +32,7 @@ console.log(result.warnings);       // anything that couldn't be read
   - Faces are triangulated in each surface's own (u, v) parameters.
   - Faces sharing an edge share its points, so closed solids give closed meshes.
   - Seams, poles and multi-turn threads are handled.
+  - Large files can be tessellated in web workers, several times faster, with `loadStepAsync(input, { workers })`. See the [API](Documentation/API.md#readstepasyncinput-options).
 - **Structure:**
   - Products and assemblies, with instances placed by context-dependent shape representations or by mapped items.
   - Instances of the same part share geometry.

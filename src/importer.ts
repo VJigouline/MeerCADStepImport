@@ -3,20 +3,16 @@
 // CONTEXT_DEPENDENT_SHAPE_REPRESENTATION or MAPPED_ITEM, and representation units.
 
 import { identity, invert, isIdentity, multiply, type Mat4 } from './geometry/math.js';
-import { GeometryReader } from './brep/geometry.js';
-import { ShapeTessellator, Warnings, type StyledMesh, type TessellationOptions, type TessellationStats } from './brep/shapes.js';
-import { StyleTable, type StepStyle } from './brep/styles.js';
+import type { ShapeTessellator, StyledMesh, Warnings } from './brep/shapes.js';
+import { DEFAULT_STYLE, type StepStyle, type StyleTable } from './brep/styles.js';
 import { UnitReader, type Units } from './brep/units.js';
-import { refId, refIds, str, StepModel } from './step/access.js';
-import { detectSchema, type StepSchemaInfo } from './step/schema.js';
+import { TessellationContext, type StepImportOptions } from './context.js';
+import { refId, refIds, str, type StepModel } from './step/access.js';
+import { StepWorkerPool, type StepWorkerOptions } from './parallel.js';
+import { detectSchema, UnsupportedSchemaError, type StepSchemaInfo } from './step/schema.js';
 import { StepFile, stepText, type StepHeader } from './step/step.js';
 
-export interface StepImportOptions extends Partial<TessellationOptions> {
-  /** Draw items that the file hides with INVISIBILITY. Default false. */
-  includeHidden?: boolean;
-  /** Where a product has both a B-rep and an AP242 tessellated shape, use the tessellated one. Default false. */
-  preferTessellated?: boolean;
-}
+export type { StepImportOptions } from './context.js';
 
 export interface StepProduct {
   /** PRODUCT id, often a part number. */
@@ -66,13 +62,6 @@ export interface StepImportResult {
   };
 }
 
-const DEFAULTS: TessellationOptions = {
-  relativeTolerance: 0.001,
-  absoluteTolerance: null,
-  angularTolerance: 0.2,
-  maxTrianglesPerFace: 50000,
-};
-
 const TESSELLATED_ITEMS = ['TESSELLATED_SOLID', 'TESSELLATED_SHELL', 'TRIANGULATED_FACE', 'COMPLEX_TRIANGULATED_FACE', 'TRIANGULATED_SURFACE_SET', 'COMPLEX_TRIANGULATED_SURFACE_SET'];
 const BREP_ITEMS = ['MANIFOLD_SOLID_BREP', 'BREP_WITH_VOIDS', 'FACETED_BREP', 'SHELL_BASED_SURFACE_MODEL', 'FACE_BASED_SURFACE_MODEL'];
 
@@ -96,8 +85,98 @@ export function readStep(input: string | ArrayBuffer | Uint8Array, options: Step
   const text = stepText(input);
   const file = new StepFile(text);
   const schema = detectSchema(file.header.schemas);
-  return new Importer(file, schema, options).run();
+  return new Importer(new TessellationContext(file, options), schema, options).run();
 }
+
+/**
+ * Like readStep, with the tessellation spread over workers when `workers` is given: each reads
+ * the file, while this thread reads the product structure, and then tessellates shape items,
+ * largest first. The result is the same as readStep's. If the workers can't be used, the file is
+ * read on this thread, with a warning saying why.
+ */
+export async function readStepAsync(input: string | ArrayBuffer | Uint8Array, options: StepImportOptions & { workers?: StepWorkerOptions } = {}): Promise<StepImportResult> {
+  const { workers, ...importOptions } = options;
+  if (!workers) return readStep(input, importOptions);
+  let pool: StepWorkerPool;
+  try {
+    // Started first, so the workers read the file while this thread does.
+    pool = new StepWorkerPool(input, importOptions, workers);
+  } catch (error) {
+    return withWarning(readStep(input, importOptions), error);
+  }
+  try {
+    const file = new StepFile(stepText(input));
+    const schema = detectSchema(file.header.schemas);
+    const context = new TessellationContext(file, importOptions);
+    const requests = planTessellation(context, schema, importOptions);
+    const meshes = new Map<string, StyledMesh[]>();
+    if (requests.length) {
+      await pool.run(
+        requests,
+        r => context.tessellator(r.angle).faceCount(r.itemId),
+        (r, result, warnings, stats) => {
+          meshes.set(r.key, result);
+          context.warnings.merge(warnings);
+          context.stats.faces += stats.faces;
+          context.stats.failedFaces += stats.failedFaces;
+          context.stats.triangles += stats.triangles;
+        },
+      );
+    }
+    return readWithMeshes(context, schema, importOptions, meshes);
+  } catch (error) {
+    if (error instanceof UnsupportedSchemaError) throw error;
+    return withWarning(readStep(input, importOptions), error);
+  } finally {
+    pool.close();
+  }
+}
+
+function withWarning(result: StepImportResult, error: unknown): StepImportResult {
+  const message = error instanceof Error ? error.message : String(error);
+  result.warnings.push(`Read without workers: ${message}`);
+  return result;
+}
+
+/** A shape item the product structure draws, to tessellate ahead of building the tree. */
+export interface TessellationRequest {
+  /** Key of the item's meshes in the importer's cache. */
+  key: string;
+  itemId: number;
+  /** Radians per plane angle unit of its representation. */
+  angle: number;
+  style: StepStyle | null;
+}
+
+/**
+ * The shape items that building the tree will tessellate, found by walking the product
+ * structure without tessellating. Leaves the context as it was.
+ */
+export function planTessellation(context: TessellationContext, schema: StepSchemaInfo, options: StepImportOptions): TessellationRequest[] {
+  const plan = new Map<string, TessellationRequest>();
+  new Importer(context, schema, options, { plan }).run();
+  // Warnings from the walk come again when the tree is built.
+  context.warnings.clear();
+  return [...plan.values()];
+}
+
+/**
+ * Builds the tree with meshes already tessellated, by `planTessellation`'s keys. Items without
+ * them, if any, are tessellated here.
+ */
+export function readWithMeshes(context: TessellationContext, schema: StepSchemaInfo, options: StepImportOptions, meshes: Map<string, StyledMesh[]>): StepImportResult {
+  return new Importer(context, schema, options, { prefill: meshes }).run();
+}
+
+/** Stands in for an item's meshes while planning, so the walk goes on as if it had some. */
+const PLACEHOLDER: StyledMesh = {
+  name: '',
+  itemId: 0,
+  itemType: '',
+  style: DEFAULT_STYLE,
+  data: { positions: new Float32Array(0), normals: new Float32Array(0), indices: new Uint32Array(0), colors: null },
+  edges: null,
+};
 
 interface Occurrence {
   id: number;
@@ -108,13 +187,13 @@ interface Occurrence {
 
 class Importer {
   private readonly m: StepModel;
+  private readonly file: StepFile;
   private readonly units: UnitReader;
   private readonly styles: StyleTable;
-  private readonly warnings = new Warnings();
-  private readonly stats: TessellationStats = { faces: 0, failedFaces: 0, triangles: 0 };
-  private readonly options: TessellationOptions;
-  private readonly readers = new Map<number, ShapeTessellator>();
+  private readonly warnings: Warnings;
   private readonly meshCache = new Map<string, StyledMesh[]>();
+  /** Planning: shape items are listed here instead of tessellated. */
+  private readonly plan: Map<string, TessellationRequest> | null;
 
   private readonly products = new Map<number, StepProduct>();
   private readonly pdReps = new Map<number, number[]>();
@@ -125,17 +204,19 @@ class Importer {
   private readonly links = new Map<number, number[]>();
   private lengthUnit: Units | null = null;
 
-  constructor(readonly file: StepFile, readonly schema: StepSchemaInfo, readonly importOptions: StepImportOptions) {
-    this.m = new StepModel(file);
+  constructor(
+    readonly context: TessellationContext,
+    readonly schema: StepSchemaInfo,
+    readonly importOptions: StepImportOptions,
+    mode: { plan?: Map<string, TessellationRequest>; prefill?: Map<string, StyledMesh[]> } = {},
+  ) {
+    this.file = context.file;
+    this.m = context.model;
     this.units = new UnitReader(this.m);
-    this.styles = new StyleTable(this.m);
-    if (importOptions.includeHidden) this.styles.hidden.clear();
-    this.options = {
-      relativeTolerance: importOptions.relativeTolerance ?? DEFAULTS.relativeTolerance,
-      absoluteTolerance: importOptions.absoluteTolerance ?? DEFAULTS.absoluteTolerance,
-      angularTolerance: importOptions.angularTolerance ?? DEFAULTS.angularTolerance,
-      maxTrianglesPerFace: importOptions.maxTrianglesPerFace ?? DEFAULTS.maxTrianglesPerFace,
-    };
+    this.styles = context.styles;
+    this.warnings = context.warnings;
+    this.plan = mode.plan ?? null;
+    if (mode.prefill) for (const [key, meshes] of mode.prefill) this.meshCache.set(key, meshes);
   }
 
   run(): StepImportResult {
@@ -172,9 +253,9 @@ class Importer {
       stats: {
         entities: this.file.size,
         products: this.products.size,
-        faces: this.stats.faces,
-        failedFaces: this.stats.failedFaces,
-        triangles: this.stats.triangles,
+        faces: this.context.stats.faces,
+        failedFaces: this.context.stats.failedFaces,
+        triangles: this.context.stats.triangles,
         meshes,
       },
     };
@@ -321,13 +402,7 @@ class Importer {
   private readonly skipReps = new Set<number>();
 
   private reader(units: Units): ShapeTessellator {
-    let t = this.readers.get(units.angle);
-    if (!t) {
-      const geometry = new GeometryReader(this.m, units.angle);
-      t = new ShapeTessellator(this.m, geometry, this.styles, this.options, this.warnings, this.stats);
-      this.readers.set(units.angle, t);
-    }
-    return t;
+    return this.context.tessellator(units.angle);
   }
 
   private repUnits(rep: number): Units {
@@ -394,7 +469,12 @@ class Importer {
         const cacheKey = `${itemId}|${units.angle}|${style ? style.name + style.color.join(',') : ''}`;
         let meshes = this.meshCache.get(cacheKey);
         if (!meshes) {
-          meshes = tessellator.tessellate(itemId, style);
+          if (this.plan) {
+            this.plan.set(cacheKey, { key: cacheKey, itemId, angle: units.angle, style });
+            meshes = [PLACEHOLDER];
+          } else {
+            meshes = tessellator.tessellate(itemId, style);
+          }
           this.meshCache.set(cacheKey, meshes);
         }
         for (const mesh of meshes) {
@@ -481,6 +561,8 @@ class Importer {
     const units = this.units.ofContext(m.idsOf('GLOBAL_UNIT_ASSIGNED_CONTEXT')[0] ?? null);
     this.lengthUnit ??= units;
     const tessellator = this.reader(units);
+    // Rare enough to leave to the main thread when tessellating in workers.
+    if (this.plan) return [];
     for (const id of m.idsOf('MANIFOLD_SOLID_BREP', 'BREP_WITH_VOIDS', 'FACETED_BREP', 'SHELL_BASED_SURFACE_MODEL', 'FACE_BASED_SURFACE_MODEL', 'TESSELLATED_SOLID', 'TESSELLATED_SHELL')) {
       if (used.has(id)) continue;
       for (const mesh of tessellator.tessellate(id, null)) node.meshes.push({ ...mesh, matrix: scaleMatrix(units.length) });

@@ -251,9 +251,53 @@ export class BSplineCurve implements Curve {
     for (let i = 0; i + 1 < starts.length; i++) {
       for (let j = 1; j <= per; j++) refined.push(starts[i]! + ((starts[i + 1]! - starts[i]!) * j) / per);
     }
-    const out = adaptive(this, refined, tolerance, angle);
+    // Knots can be far denser than the tolerances need, as on curves exported with a knot every
+    // few degrees: thin the points out, but well within the tolerances, as edges of sliver
+    // faces can run closer together than the tolerance and coarse chords of the two could cross.
+    // Keep at least the `degree` segments a single knot span gets: faces never split their
+    // boundary edges, and a long edge across a curved surface would leave slivers along it.
+    const out = simplify(this, adaptive(this, refined, tolerance, angle), tolerance / 4, angle / 2, per);
     return a <= b ? out : out.reverse();
   }
+}
+
+/**
+ * Drops sample parameters while every dropped point stays within `tolerance` of the chord that
+ * replaces it and the curve turns by no more than `angle` along the chord. The ends are kept, and
+ * at least `minSegments` segments (fewer only if there were fewer to start with).
+ */
+function simplify(curve: Curve, ts: number[], tolerance: number, angle: number, minSegments: number): number[] {
+  if (ts.length - 1 <= minSegments) return ts;
+  const ps = ts.map(t => curve.point(t));
+  const out = [ts[0]!];
+  let anchor = 0;
+  while (anchor < ts.length - 1) {
+    // Extend the chord from the anchor as far as it stays within the tolerances.
+    let end = anchor + 1;
+    let turning = 0;
+    // At most 256 points to a chord, which keeps the checks linear in the number of points.
+    for (let j = anchor + 2; j < Math.min(ts.length, anchor + 256); j++) {
+      const d0 = sub(ps[j - 1]!, ps[j - 2]!), d1 = sub(ps[j]!, ps[j - 1]!);
+      const l0 = length(d0), l1 = length(d1);
+      if (l0 > 0 && l1 > 0) turning += Math.acos(Math.min(1, Math.max(-1, dot(d0, d1) / (l0 * l1))));
+      if (turning > angle) break;
+      const a = ps[anchor]!, chord = sub(ps[j]!, a), cl = length(chord);
+      let within = true;
+      for (let i = anchor + 1; i < j && within; i++) {
+        const d = cl > 0 ? length(cross(sub(ps[i]!, a), chord)) / cl : length(sub(ps[i]!, a));
+        within = d <= tolerance;
+      }
+      if (!within) break;
+      end = j;
+    }
+    out.push(ts[end]!);
+    anchor = end;
+  }
+  if (out.length - 1 >= minSegments) return out;
+  // Too few: evenly spread picks from the samples instead.
+  const picked: number[] = [];
+  for (let i = 0; i <= minSegments; i++) picked.push(ts[Math.round((i * (ts.length - 1)) / minSegments)]!);
+  return picked;
 }
 
 /** Polyline through points; the parameter runs from 0 at the first point by one per segment. */

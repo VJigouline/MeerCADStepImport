@@ -16,10 +16,77 @@ It throws in two cases:
 ## loadStepAsync(input, options?)
 
 ```ts
-loadStepAsync(input: string | ArrayBuffer | Uint8Array, options?: StepImportOptions & StepThreeOptions): Promise<StepLoadResult>
+loadStepAsync(input: string | ArrayBuffer | Uint8Array, options?: StepImportOptions & StepThreeOptions & { workers?: StepWorkerOptions }): Promise<StepLoadResult>
 ```
 
 Like `loadStep`, and it also reads gzip-compressed files (`.stpz`). It recognises them by their first bytes and inflates them with the platform's `DecompressionStream`.
+
+With `workers`, the tessellation is spread over workers, as described under `readStepAsync`.
+
+## readStepAsync(input, options?)
+
+```ts
+readStepAsync(input: string | ArrayBuffer | Uint8Array, options?: StepImportOptions & { workers?: StepWorkerOptions }): Promise<StepImportResult>
+```
+
+Like `readStep`. With `workers`, the shape items are tessellated in workers, and the result is the same as `readStep`'s.
+
+1. The workers each read the file while this thread reads the product structure.
+2. This thread hands them the shape items one at a time, those with the most faces first.
+3. The meshes come back as transferred arrays, not copies, and the tree is built from them.
+
+Without `workers`, it reads on this thread, like `readStep`.
+
+On an 8-core machine, a 95 MB file with 6 000 faces takes 15 s on one thread and 5.6 s with six workers. Small files are quicker without workers, which take a few hundred milliseconds to start.
+
+If the workers can't be started, or every one of them fails, the file is read on this thread instead. A warning then says why: `Read without workers: …`.
+
+### StepWorkerOptions
+
+| Option | Default | Meaning |
+|---|---|---|
+| `create` | (required) | `() => StepWorkerLike`: starts a worker whose script calls `runStepWorker()`. A web `Worker` is a `StepWorkerLike`. |
+| `count` | one less than the processors, at most 6 | How many workers to start. Each holds its own copy of the file's text, about the file's size. |
+
+### runStepWorker(scope?)
+
+The worker's side. Call it from the worker's script. `scope` defaults to the worker's global scope.
+
+In a browser, with a bundler that understands `new URL(…, import.meta.url)`:
+
+```ts
+// step.worker.ts
+import { runStepWorker } from 'meercad-step-import';
+runStepWorker();
+
+// The page
+const result = await loadStepAsync(bytes, {
+  workers: { create: () => new Worker(new URL('./step.worker', import.meta.url), { type: 'module' }) },
+});
+```
+
+In Node, wrap `worker_threads`, whose workers are event emitters rather than event targets:
+
+```ts
+// step-worker.mjs
+import { parentPort } from 'node:worker_threads';
+import { runStepWorker } from 'meercad-step-import';
+runStepWorker({
+  postMessage: (message, transfer) => parentPort.postMessage(message, transfer),
+  addEventListener: (type, listener) => parentPort.on(type, data => listener({ data })),
+});
+
+// The caller
+const create = () => {
+  const worker = new Worker(new URL('./step-worker.mjs', import.meta.url));
+  return {
+    postMessage: (message, transfer) => worker.postMessage(message, transfer),
+    addEventListener: (type, listener) => worker.on(type, data => listener(type === 'message' ? { data } : data)),
+    terminate: () => worker.terminate(),
+  };
+};
+const result = await readStepAsync(bytes, { workers: { create } });
+```
 
 ## readStep(input, options?)
 

@@ -38,11 +38,16 @@
 ## How faces are tessellated
 
 1. **Edges:** each edge is sampled once between its vertices, to the chord and angle tolerances. Faces sharing an edge share its points, so closed solids give closed meshes.
+   - B-spline edges start from points at their knots, and some files have a knot every few degrees.
+   - Those points are thinned out to a quarter of the chord tolerance and half the angle. That keeps the edges of sliver faces from crossing each other.
+   - An edge always keeps at least as many segments as its degree.
 2. **Projection:** each face's boundary is projected into the surface's (u, v) parameters, analytically for elementary surfaces and by Newton's method for the others.
 3. **Closed surfaces:** the boundary is cut at the seam and moved into one period. The pieces are joined along the seam, round poles and cone apexes, and along the domain's edges. This covers bands round cylinders, caps at poles, faces that are a whole sphere or torus, and threads that wind round many times.
 4. **Seam edges:** an edge that a face uses twice on a closed surface is a seam with the face on both sides. It is left out, and the face is closed across it.
 5. **Interior:** a grid of points is added inside the face. The grid's spacing comes from the surface's curvature in each direction.
-6. **Triangulation:** the points are triangulated in (u, v) and made Delaunay by edge flips. Edges and triangles too far from the surface, or with normals too far apart, are then split until the tolerances are met.
+6. **Triangulation:** the points are triangulated in (u, v), and edge flips make the result Delaunay.
+   - The flips run until none is left, so long thin faces aren't left half-flipped.
+   - Edges and triangles too far from the surface, or with normals too far apart, are then split until the tolerances are met.
 7. **Normals:** come from the surface itself, flipped where the face is against the surface's direction.
 
 The chord tolerance is 0.1% of each solid's size by default, and the angle tolerance 0.2 rad. Inside faces, the mesh may be up to twice the chord tolerance from the surface.

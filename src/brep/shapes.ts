@@ -54,6 +54,16 @@ export class Warnings {
   list(): string[] {
     return [...this.counts].map(([message, count]) => (count > 1 ? `${message} (${count} times)` : message));
   }
+  /** Each message with its count, to pass to another Warnings. */
+  entries(): [string, number][] {
+    return [...this.counts];
+  }
+  clear(): void {
+    this.counts.clear();
+  }
+  merge(entries: readonly (readonly [string, number])[]): void {
+    for (const [message, count] of entries) this.counts.set(message, (this.counts.get(message) ?? 0) + count);
+  }
 }
 
 const SOLIDS = ['MANIFOLD_SOLID_BREP', 'BREP_WITH_VOIDS', 'FACETED_BREP', 'FACETED_BREP_AND_BREP_WITH_VOIDS'];
@@ -72,7 +82,12 @@ interface FaceRef {
 }
 
 export class ShapeTessellator {
-  private readonly edges = new Map<number, Vec3[]>();
+  /**
+   * Sampled edges by tolerance and edge id: faces share edges. By tolerance too, so an item's
+   * mesh doesn't depend on which items were tessellated before it, as items are when they are
+   * split between workers.
+   */
+  private readonly edges = new Map<number, Map<number, Vec3[]>>();
 
   constructor(
     readonly model: StepModel,
@@ -123,6 +138,14 @@ export class ShapeTessellator {
       out.push({ name, itemId, itemType: m.displayType(e), style, data: builder.build(), edges: edges.build() });
     }
     return out;
+  }
+
+  /** How many faces an item has: a guide to how long it takes to tessellate. */
+  faceCount(itemId: number): number {
+    const faces: FaceRef[] = [];
+    const tessellated: FaceRef[] = [];
+    this.collect(itemId, false, null, faces, tessellated, 0);
+    return faces.length + tessellated.length;
   }
 
   private collect(id: number, flip: boolean, style: StepStyle | null, faces: FaceRef[], tessellated: FaceRef[], depth: number): void {
@@ -339,7 +362,12 @@ export class ShapeTessellator {
 
   /** Points along an edge from its start vertex to its end vertex. Cached: faces share edges. */
   private edge(e: StepEntity, options: FaceOptions): Vec3[] {
-    const cached = this.edges.get(e.id);
+    let byId = this.edges.get(options.tolerance);
+    if (!byId) {
+      byId = new Map();
+      this.edges.set(options.tolerance, byId);
+    }
+    const cached = byId.get(e.id);
     if (cached) return cached;
     const g = this.geometry;
     const start = g.point(refId(e.args[1]));
@@ -352,7 +380,7 @@ export class ShapeTessellator {
     } else {
       points = [start, end];
     }
-    this.edges.set(e.id, points);
+    byId.set(e.id, points);
     return points;
   }
 

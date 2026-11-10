@@ -278,13 +278,19 @@ abstract class NumericSurface implements Surface {
     if (vClosed) this.vPeriod = this.v1 - this.v0;
   }
 
+  private sizeCache = 0;
+
+  /** About how big the surface is, from a 5 x 5 grid of its points. Measured once. */
   protected size(): number {
+    if (this.sizeCache > 0) return this.sizeCache;
     const a = this.evaluate(this.u0, this.v0)[0];
     let s = 0;
     for (let i = 0; i <= 4; i++) for (let j = 0; j <= 4; j++) {
       const p = this.evaluate(this.u0 + ((this.u1 - this.u0) * i) / 4, this.v0 + ((this.v1 - this.v0) * j) / 4)[0];
       s = Math.max(s, length(sub(p, a)));
     }
+    // Only once the domain is known: subclasses call this from their constructors.
+    if (Number.isFinite(this.u0) && Number.isFinite(this.v0)) this.sizeCache = s || 1;
     return s || 1;
   }
 
